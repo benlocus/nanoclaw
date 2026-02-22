@@ -1,6 +1,11 @@
+import fs from 'fs';
+import path from 'path';
+import { pipeline } from 'node:stream/promises';
+import { Readable } from 'node:stream';
+
 import { App } from '@slack/bolt';
 
-import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
+import { ASSISTANT_NAME, TRIGGER_PATTERN, GROUPS_DIR } from '../config.js';
 import {
   getLastGroupSync,
   setLastGroupSync,
@@ -15,6 +20,13 @@ import {
 } from '../types.js';
 
 const CHANNEL_SYNC_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
+const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50 MB
+
+function formatFileSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
 
 export interface SlackChannelOpts {
   onMessage: OnInboundMessage;
@@ -106,21 +118,6 @@ export class SlackChannel implements Channel {
       );
     }
 
-    // File attachments → placeholders
-    if (event.files && Array.isArray(event.files)) {
-      const filePlaceholders = event.files
-        .map(
-          (f: any) =>
-            `[${f.filetype?.toUpperCase() || 'File'}: ${f.name || 'unnamed'}]`,
-        )
-        .join(' ');
-      if (!content) {
-        content = filePlaceholders;
-      } else {
-        content = `${content} ${filePlaceholders}`;
-      }
-    }
-
     // Get sender display name
     const senderName = await this.getUserDisplayName(event.user);
     const msgId = `${channelId}-${event.ts}`;
@@ -133,6 +130,49 @@ export class SlackChannel implements Channel {
     if (!group) {
       logger.debug({ jid }, 'Message from unregistered Slack channel');
       return;
+    }
+
+    // Download file attachments to group uploads folder
+    if (event.files && Array.isArray(event.files)) {
+      const uploadsDir = path.join(GROUPS_DIR, group.folder, 'uploads');
+      fs.mkdirSync(uploadsDir, { recursive: true });
+
+      const fileParts: string[] = [];
+      for (const f of event.files) {
+        const fileName = f.name || `file-${f.id || Date.now()}`;
+        const fileType = f.filetype?.toUpperCase() || 'File';
+
+        // Skip files that are too large
+        if (f.size && f.size > MAX_FILE_SIZE) {
+          fileParts.push(`[${fileType}: ${fileName} — too large (${formatFileSize(f.size)}), skipped]`);
+          continue;
+        }
+
+        // Skip external files or files without download URL
+        const downloadUrl = f.url_private_download || f.url_private;
+        if (!downloadUrl) {
+          fileParts.push(`[${fileType}: ${fileName}]`);
+          continue;
+        }
+
+        // Unique filename: ts-fileId-originalName (safe characters only)
+        const safeName = `${event.ts}-${f.id || 'x'}-${fileName}`.replace(/[^a-zA-Z0-9._-]/g, '_');
+        const hostPath = path.join(uploadsDir, safeName);
+        const containerPath = `/workspace/group/uploads/${safeName}`;
+
+        const ok = await this.downloadFile(downloadUrl, hostPath);
+        if (ok) {
+          const sizeStr = f.size ? ` ${formatFileSize(f.size)}` : '';
+          fileParts.push(`[File: ${containerPath}] (${fileType}: ${fileName},${sizeStr})`);
+        } else {
+          fileParts.push(`[${fileType}: ${fileName} — download failed]`);
+        }
+      }
+
+      if (fileParts.length > 0) {
+        const fileInfo = fileParts.join('\n');
+        content = content ? `${content}\n${fileInfo}` : fileInfo;
+      }
     }
 
     this.opts.onMessage(jid, {
@@ -150,6 +190,30 @@ export class SlackChannel implements Channel {
     this.typingReactions.set(jid, { channel: channelId, timestamp: event.ts });
 
     logger.info({ jid, sender: senderName }, 'Slack message stored');
+  }
+
+  private async downloadFile(url: string, destPath: string): Promise<boolean> {
+    try {
+      const response = await fetch(url, {
+        headers: { Authorization: `Bearer ${this.botToken}` },
+        signal: AbortSignal.timeout(60_000),
+      });
+
+      if (!response.ok || !response.body) {
+        logger.warn({ url: url.slice(0, 80), status: response.status }, 'File download HTTP error');
+        return false;
+      }
+
+      await pipeline(
+        Readable.fromWeb(response.body as ReadableStream),
+        fs.createWriteStream(destPath),
+      );
+      return true;
+    } catch (err) {
+      try { fs.unlinkSync(destPath); } catch { /* partial file cleanup */ }
+      logger.warn({ err }, 'File download failed');
+      return false;
+    }
   }
 
   async sendMessage(jid: string, text: string): Promise<void> {

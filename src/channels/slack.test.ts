@@ -6,6 +6,7 @@ import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
 vi.mock('../config.js', () => ({
   ASSISTANT_NAME: 'Andy',
   TRIGGER_PATTERN: /^@Andy\b/i,
+  GROUPS_DIR: '/tmp/nanoclaw-test/groups',
 }));
 
 // Mock logger
@@ -281,10 +282,11 @@ describe('SlackChannel', () => {
       });
       await triggerMessage(event);
 
+      // File has no download URL, so falls back to placeholder
       expect(opts.onMessage).toHaveBeenCalledWith(
         'slack:C1234567890',
         expect.objectContaining({
-          content: 'Check this [PDF: doc.pdf]',
+          content: 'Check this\n[PDF: doc.pdf]',
         }),
       );
     });
@@ -406,46 +408,185 @@ describe('SlackChannel', () => {
   // --- File attachments ---
 
   describe('file attachments', () => {
-    it('adds file placeholders to content', async () => {
+    let fetchSpy: ReturnType<typeof vi.spyOn>;
+    let mkdirSyncSpy: ReturnType<typeof vi.spyOn>;
+    let createWriteStreamSpy: ReturnType<typeof vi.spyOn>;
+    let unlinkSyncSpy: ReturnType<typeof vi.spyOn>;
+
+    beforeEach(async () => {
+      const fs = await import('fs');
+      const { Writable } = await import('node:stream');
+      mkdirSyncSpy = vi.spyOn(fs.default, 'mkdirSync').mockReturnValue(undefined);
+      createWriteStreamSpy = vi.spyOn(fs.default, 'createWriteStream').mockReturnValue(
+        new Writable({ write(_chunk, _enc, cb) { cb(); } }) as any,
+      );
+      unlinkSyncSpy = vi.spyOn(fs.default, 'unlinkSync').mockReturnValue(undefined);
+
+      // Default: successful download
+      fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue({
+        ok: true,
+        status: 200,
+        body: new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode('file-data'));
+            controller.close();
+          },
+        }),
+      } as Response);
+    });
+
+    afterEach(() => {
+      fetchSpy?.mockRestore();
+      mkdirSyncSpy?.mockRestore();
+      createWriteStreamSpy?.mockRestore();
+      unlinkSyncSpy?.mockRestore();
+    });
+
+    it('downloads file and includes container path in content', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel('xoxb-test', 'xapp-test', opts);
+      await channel.connect();
+
+      const event = createMessageEvent({
+        text: 'Check this out',
+        files: [{
+          id: 'F08ABC123',
+          name: 'report.pdf',
+          filetype: 'pdf',
+          size: 2500000,
+          url_private_download: 'https://files.slack.com/files-pri/T00/download/report.pdf',
+        }],
+      });
+      await triggerMessage(event);
+
+      // Verify fetch called with Bearer auth
+      expect(fetchSpy).toHaveBeenCalledWith(
+        'https://files.slack.com/files-pri/T00/download/report.pdf',
+        expect.objectContaining({
+          headers: { Authorization: 'Bearer xoxb-test' },
+        }),
+      );
+
+      // Verify content includes container path and file info
+      const call = vi.mocked(opts.onMessage).mock.calls[0];
+      const content = call[1].content;
+      expect(content).toContain('Check this out');
+      expect(content).toContain('/workspace/group/uploads/');
+      expect(content).toContain('PDF: report.pdf');
+      expect(content).toContain('2.4 MB');
+    });
+
+    it('falls back to placeholder on download failure', async () => {
+      fetchSpy.mockRejectedValueOnce(new Error('Network error'));
+
+      const opts = createTestOpts();
+      const channel = new SlackChannel('xoxb-test', 'xapp-test', opts);
+      await channel.connect();
+
+      const event = createMessageEvent({
+        text: '',
+        subtype: 'file_share',
+        files: [{
+          id: 'F001',
+          name: 'doc.pdf',
+          filetype: 'pdf',
+          url_private_download: 'https://files.slack.com/download/doc.pdf',
+        }],
+      });
+      await triggerMessage(event);
+
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'slack:C1234567890',
+        expect.objectContaining({
+          content: expect.stringContaining('download failed'),
+        }),
+      );
+
+      // Verify partial file cleanup attempted
+      expect(unlinkSyncSpy).toHaveBeenCalled();
+    });
+
+    it('skips files exceeding size limit', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel('xoxb-test', 'xapp-test', opts);
+      await channel.connect();
+
+      const event = createMessageEvent({
+        text: '',
+        subtype: 'file_share',
+        files: [{
+          id: 'F002',
+          name: 'huge.zip',
+          filetype: 'zip',
+          size: 100 * 1024 * 1024, // 100 MB
+          url_private_download: 'https://files.slack.com/download/huge.zip',
+        }],
+      });
+      await triggerMessage(event);
+
+      // Fetch should NOT be called
+      expect(fetchSpy).not.toHaveBeenCalled();
+
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'slack:C1234567890',
+        expect.objectContaining({
+          content: expect.stringContaining('too large'),
+        }),
+      );
+    });
+
+    it('handles files without download URL', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel('xoxb-test', 'xapp-test', opts);
+      await channel.connect();
+
+      const event = createMessageEvent({
+        text: '',
+        subtype: 'file_share',
+        files: [{
+          id: 'F003',
+          name: 'external.pdf',
+          filetype: 'pdf',
+        }],
+      });
+      await triggerMessage(event);
+
+      // Fetch should NOT be called
+      expect(fetchSpy).not.toHaveBeenCalled();
+
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'slack:C1234567890',
+        expect.objectContaining({
+          content: '[PDF: external.pdf]',
+        }),
+      );
+    });
+
+    it('preserves text content alongside file paths', async () => {
       const opts = createTestOpts();
       const channel = new SlackChannel('xoxb-test', 'xapp-test', opts);
       await channel.connect();
 
       const event = createMessageEvent({
         text: 'Here is the file',
-        files: [{ name: 'report.pdf', filetype: 'pdf' }],
+        files: [{
+          id: 'F004',
+          name: 'report.pdf',
+          filetype: 'pdf',
+          size: 1024,
+          url_private_download: 'https://files.slack.com/download/report.pdf',
+        }],
       });
       await triggerMessage(event);
 
-      expect(opts.onMessage).toHaveBeenCalledWith(
-        'slack:C1234567890',
-        expect.objectContaining({
-          content: 'Here is the file [PDF: report.pdf]',
-        }),
-      );
+      const call = vi.mocked(opts.onMessage).mock.calls[0];
+      const content = call[1].content;
+      // Text comes first, file info on new line
+      expect(content).toMatch(/^Here is the file\n/);
+      expect(content).toContain('/workspace/group/uploads/');
     });
 
-    it('uses file placeholder as content when no text', async () => {
-      const opts = createTestOpts();
-      const channel = new SlackChannel('xoxb-test', 'xapp-test', opts);
-      await channel.connect();
-
-      const event = createMessageEvent({
-        subtype: 'file_share',
-        text: '',
-        files: [{ name: 'image.png', filetype: 'png' }],
-      });
-      await triggerMessage(event);
-
-      expect(opts.onMessage).toHaveBeenCalledWith(
-        'slack:C1234567890',
-        expect.objectContaining({
-          content: '[PNG: image.png]',
-        }),
-      );
-    });
-
-    it('handles multiple files', async () => {
+    it('creates uploads directory', async () => {
       const opts = createTestOpts();
       const channel = new SlackChannel('xoxb-test', 'xapp-test', opts);
       await channel.connect();
@@ -453,22 +594,22 @@ describe('SlackChannel', () => {
       const event = createMessageEvent({
         text: '',
         subtype: 'file_share',
-        files: [
-          { name: 'a.pdf', filetype: 'pdf' },
-          { name: 'b.jpg', filetype: 'jpg' },
-        ],
+        files: [{
+          id: 'F005',
+          name: 'test.txt',
+          filetype: 'txt',
+          url_private_download: 'https://files.slack.com/download/test.txt',
+        }],
       });
       await triggerMessage(event);
 
-      expect(opts.onMessage).toHaveBeenCalledWith(
-        'slack:C1234567890',
-        expect.objectContaining({
-          content: '[PDF: a.pdf] [JPG: b.jpg]',
-        }),
+      expect(mkdirSyncSpy).toHaveBeenCalledWith(
+        expect.stringContaining('test-channel/uploads'),
+        { recursive: true },
       );
     });
 
-    it('handles files with missing name and filetype', async () => {
+    it('uses file-only content when no text provided', async () => {
       const opts = createTestOpts();
       const channel = new SlackChannel('xoxb-test', 'xapp-test', opts);
       await channel.connect();
@@ -476,16 +617,20 @@ describe('SlackChannel', () => {
       const event = createMessageEvent({
         text: '',
         subtype: 'file_share',
-        files: [{}],
+        files: [{
+          id: 'F006',
+          name: 'image.png',
+          filetype: 'png',
+          size: 5000,
+          url_private_download: 'https://files.slack.com/download/image.png',
+        }],
       });
       await triggerMessage(event);
 
-      expect(opts.onMessage).toHaveBeenCalledWith(
-        'slack:C1234567890',
-        expect.objectContaining({
-          content: '[File: unnamed]',
-        }),
-      );
+      const call = vi.mocked(opts.onMessage).mock.calls[0];
+      const content = call[1].content;
+      expect(content).toMatch(/^\[File:/);
+      expect(content).toContain('PNG: image.png');
     });
   });
 
