@@ -858,6 +858,89 @@ describe('SlackChannel', () => {
     });
   });
 
+  // --- Thread reply routing ---
+
+  describe('thread reply routing', () => {
+    it('replies in thread when inbound message was a thread reply', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel('xoxb-test', 'xapp-test', opts);
+      await channel.connect();
+
+      // Simulate inbound thread reply
+      currentApp().client.conversations.replies.mockResolvedValueOnce({
+        messages: [
+          { ts: '1704067200.000000', bot_id: 'B123', text: 'Root message' },
+        ],
+      });
+      const event = createMessageEvent({
+        text: '<@U_BOT_123> follow up',
+        ts: '1704067200.000100',
+        thread_ts: '1704067200.000000',
+      });
+      await triggerMessage(event);
+
+      // Now send a reply — should include thread_ts
+      await channel.sendMessage('slack:C1234567890', 'Here is my response');
+
+      expect(currentApp().client.chat.postMessage).toHaveBeenCalledWith({
+        channel: 'C1234567890',
+        text: 'Here is my response',
+        thread_ts: '1704067200.000000',
+      });
+    });
+
+    it('clears thread_ts after sending so next message goes to channel', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel('xoxb-test', 'xapp-test', opts);
+      await channel.connect();
+
+      // Simulate inbound thread reply
+      currentApp().client.conversations.replies.mockResolvedValueOnce({
+        messages: [
+          { ts: '1704067200.000000', bot_id: 'B123', text: 'Root' },
+        ],
+      });
+      const event = createMessageEvent({
+        text: '<@U_BOT_123> hi',
+        ts: '1704067200.000100',
+        thread_ts: '1704067200.000000',
+      });
+      await triggerMessage(event);
+
+      // First send — goes to thread
+      await channel.sendMessage('slack:C1234567890', 'Reply 1');
+      expect(currentApp().client.chat.postMessage).toHaveBeenCalledWith(
+        expect.objectContaining({ thread_ts: '1704067200.000000' }),
+      );
+
+      vi.mocked(currentApp().client.chat.postMessage).mockClear();
+
+      // Second send — should go to channel (no thread_ts)
+      await channel.sendMessage('slack:C1234567890', 'Reply 2');
+      expect(currentApp().client.chat.postMessage).toHaveBeenCalledWith({
+        channel: 'C1234567890',
+        text: 'Reply 2',
+      });
+    });
+
+    it('sends to channel when inbound was not a thread reply', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel('xoxb-test', 'xapp-test', opts);
+      await channel.connect();
+
+      // Simulate top-level message (no thread_ts)
+      const event = createMessageEvent({ text: '<@U_BOT_123> hello' });
+      await triggerMessage(event);
+
+      await channel.sendMessage('slack:C1234567890', 'Response');
+
+      expect(currentApp().client.chat.postMessage).toHaveBeenCalledWith({
+        channel: 'C1234567890',
+        text: 'Response',
+      });
+    });
+  });
+
   // --- ownsJid ---
 
   describe('ownsJid', () => {

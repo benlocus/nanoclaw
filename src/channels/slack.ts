@@ -45,6 +45,7 @@ export class SlackChannel implements Channel {
   private channelSyncTimerStarted = false;
   private userNameCache = new Map<string, string>();
   private typingReactions = new Map<string, { channel: string; timestamp: string }>();
+  private replyThreadTs = new Map<string, string>();
 
   constructor(botToken: string, appToken: string, opts: SlackChannelOpts) {
     this.botToken = botToken;
@@ -194,6 +195,11 @@ export class SlackChannel implements Channel {
       is_bot_message: false,
     });
 
+    // Track thread_ts so replies go back to the thread
+    if (event.thread_ts) {
+      this.replyThreadTs.set(jid, event.thread_ts);
+    }
+
     // Track the latest message timestamp for typing reactions
     this.typingReactions.set(jid, { channel: channelId, timestamp: event.ts });
 
@@ -231,13 +237,20 @@ export class SlackChannel implements Channel {
     }
 
     const channel = jid.replace(/^slack:/, '');
+    const threadTs = this.replyThreadTs.get(jid);
 
     try {
       const chunks = splitMessage(text, 4000);
       for (const chunk of chunks) {
-        await this.app.client.chat.postMessage({ channel, text: chunk });
+        await this.app.client.chat.postMessage({
+          channel,
+          text: chunk,
+          ...(threadTs && { thread_ts: threadTs }),
+        });
       }
-      logger.info({ jid, length: text.length }, 'Slack message sent');
+      // Clear after sending — next top-level message should go to channel
+      this.replyThreadTs.delete(jid);
+      logger.info({ jid, length: text.length, threadTs }, 'Slack message sent');
     } catch (err) {
       logger.error({ jid, err }, 'Failed to send Slack message');
     }
