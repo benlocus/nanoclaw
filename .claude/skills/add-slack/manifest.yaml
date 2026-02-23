@@ -13,6 +13,7 @@ modifies:
   - src/container-runner.ts
   - src/routing.test.ts
   - container/agent-runner/src/index.ts
+  - container/agent-runner/src/ipc-mcp-stdio.ts
 
 structured:
   npm_dependencies:
