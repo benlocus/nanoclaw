@@ -48,6 +48,7 @@ vi.mock('@slack/bolt', () => ({
       },
       conversations: {
         list: vi.fn().mockResolvedValue({ channels: [], response_metadata: {} }),
+        replies: vi.fn().mockResolvedValue({ messages: [] }),
       },
       users: {
         info: vi.fn().mockResolvedValue({
@@ -114,6 +115,7 @@ function createMessageEvent(overrides: {
   bot_id?: string;
   subtype?: string;
   files?: any[];
+  thread_ts?: string;
 }) {
   return {
     channel: overrides.channel ?? 'C1234567890',
@@ -123,6 +125,7 @@ function createMessageEvent(overrides: {
     bot_id: overrides.bot_id,
     subtype: overrides.subtype,
     files: overrides.files,
+    thread_ts: overrides.thread_ts,
   };
 }
 
@@ -631,6 +634,151 @@ describe('SlackChannel', () => {
       const content = call[1].content;
       expect(content).toMatch(/^\[File:/);
       expect(content).toContain('PNG: image.png');
+    });
+  });
+
+  // --- Thread context ---
+
+  describe('thread context', () => {
+    it('includes full thread context for thread replies', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel('xoxb-test', 'xapp-test', opts);
+      await channel.connect();
+
+      currentApp().client.conversations.replies.mockResolvedValueOnce({
+        messages: [
+          { ts: '1704067200.000000', bot_id: 'B123', text: 'Here is your cannabis news research...' },
+          { ts: '1704067200.000050', user: 'U_USER_456', text: 'Can you summarize the key findings?' },
+          { ts: '1704067200.000075', bot_id: 'B123', text: 'Sure, here are the highlights...' },
+        ],
+      });
+
+      const event = createMessageEvent({
+        text: '<@U_BOT_123> what about regulation changes?',
+        ts: '1704067200.000100',
+        thread_ts: '1704067200.000000',
+      });
+      await triggerMessage(event);
+
+      const call = vi.mocked(opts.onMessage).mock.calls[0];
+      const content = call[1].content;
+      expect(content).toContain('[Thread context:]');
+      expect(content).toContain('[Andy]: Here is your cannabis news research...');
+      expect(content).toContain('[Test User]: Can you summarize the key findings?');
+      expect(content).toContain('[Andy]: Sure, here are the highlights...');
+      expect(content).toContain('@Andy what about regulation changes?');
+    });
+
+    it('labels bot messages with assistant name', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel('xoxb-test', 'xapp-test', opts);
+      await channel.connect();
+
+      currentApp().client.conversations.replies.mockResolvedValueOnce({
+        messages: [
+          { ts: '1704067200.000000', bot_id: 'B123', text: 'Bot posted this' },
+          { ts: '1704067200.000050', user: 'U_USER_456', text: 'User replied' },
+        ],
+      });
+
+      const event = createMessageEvent({
+        text: '<@U_BOT_123> follow up',
+        ts: '1704067200.000050',
+        thread_ts: '1704067200.000000',
+      });
+      await triggerMessage(event);
+
+      const call = vi.mocked(opts.onMessage).mock.calls[0];
+      const content = call[1].content;
+      expect(content).toContain('[Andy]: Bot posted this');
+    });
+
+    it('does not fetch thread context for non-thread messages', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel('xoxb-test', 'xapp-test', opts);
+      await channel.connect();
+
+      const event = createMessageEvent({ text: 'Top-level message' });
+      await triggerMessage(event);
+
+      expect(currentApp().client.conversations.replies).not.toHaveBeenCalled();
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'slack:C1234567890',
+        expect.objectContaining({ content: 'Top-level message' }),
+      );
+    });
+
+    it('does not fetch thread context for thread root message', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel('xoxb-test', 'xapp-test', opts);
+      await channel.connect();
+
+      // thread_ts === ts means this IS the root
+      const event = createMessageEvent({
+        text: 'Root message',
+        ts: '1704067200.000000',
+        thread_ts: '1704067200.000000',
+      });
+      await triggerMessage(event);
+
+      expect(currentApp().client.conversations.replies).not.toHaveBeenCalled();
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'slack:C1234567890',
+        expect.objectContaining({ content: 'Root message' }),
+      );
+    });
+
+    it('delivers message without context when thread fetch fails', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel('xoxb-test', 'xapp-test', opts);
+      await channel.connect();
+
+      currentApp().client.conversations.replies.mockRejectedValueOnce(
+        new Error('channel_not_found'),
+      );
+
+      const event = createMessageEvent({
+        text: '<@U_BOT_123> hello',
+        ts: '1704067200.000100',
+        thread_ts: '1704067200.000000',
+      });
+      await triggerMessage(event);
+
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'slack:C1234567890',
+        expect.objectContaining({ content: '@Andy hello' }),
+      );
+    });
+
+    it('truncates long thread context to stay under limit', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel('xoxb-test', 'xapp-test', opts);
+      await channel.connect();
+
+      // Create messages that exceed 4000 chars total
+      const longMessages = Array.from({ length: 10 }, (_, i) => ({
+        ts: `1704067200.00${String(i).padStart(4, '0')}`,
+        user: 'U_USER_456',
+        text: 'A'.repeat(500),
+      }));
+
+      currentApp().client.conversations.replies.mockResolvedValueOnce({
+        messages: longMessages,
+      });
+
+      const event = createMessageEvent({
+        text: '<@U_BOT_123> summarize',
+        ts: '1704067200.009999',
+        thread_ts: '1704067200.000000',
+      });
+      await triggerMessage(event);
+
+      const call = vi.mocked(opts.onMessage).mock.calls[0];
+      const content = call[1].content;
+      const contextEnd = content.indexOf('\n\n@Andy summarize');
+      const contextBlock = content.slice(0, contextEnd);
+      expect(contextBlock.length).toBeLessThanOrEqual(4100); // context header + 4000 char limit
+      expect(contextBlock).toContain('[... earlier messages truncated]');
     });
   });
 

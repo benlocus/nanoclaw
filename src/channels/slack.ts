@@ -132,6 +132,14 @@ export class SlackChannel implements Channel {
       return;
     }
 
+    // Fetch thread context for thread replies
+    if (event.thread_ts && event.thread_ts !== event.ts) {
+      const threadContext = await this.getThreadContext(channelId, event.thread_ts, event.ts);
+      if (threadContext) {
+        content = `${threadContext}\n\n${content}`;
+      }
+    }
+
     // Download file attachments to group uploads folder
     if (event.files && Array.isArray(event.files)) {
       const uploadsDir = path.join(GROUPS_DIR, group.folder, 'uploads');
@@ -327,6 +335,56 @@ export class SlackChannel implements Channel {
       logger.info({ count }, 'Channel metadata synced');
     } catch (err) {
       logger.error({ err }, 'Failed to sync channel metadata');
+    }
+  }
+
+  private async getThreadContext(
+    channelId: string,
+    threadTs: string,
+    currentTs: string,
+  ): Promise<string | null> {
+    if (!this.app) return null;
+
+    try {
+      const result = await this.app.client.conversations.replies({
+        channel: channelId,
+        ts: threadTs,
+      });
+
+      const messages = result.messages;
+      if (!messages || messages.length <= 1) return null;
+
+      // Exclude the current message (it's delivered normally)
+      const threadHistory = messages.filter(
+        (m: any) => m.ts !== currentTs,
+      );
+
+      const parts: string[] = [];
+      let totalLen = 0;
+      const MAX_CONTEXT_LEN = 4000;
+
+      for (const msg of threadHistory) {
+        const name = (msg as any).bot_id
+          ? ASSISTANT_NAME
+          : await this.getUserDisplayName((msg as any).user || 'unknown');
+        let text = (msg as any).text || '[no text]';
+        if (text.length > 1500) text = text.slice(0, 1500) + '...';
+
+        const line = `[${name}]: ${text}`;
+        if (totalLen + line.length > MAX_CONTEXT_LEN) {
+          parts.push('[... earlier messages truncated]');
+          break;
+        }
+        parts.push(line);
+        totalLen += line.length;
+      }
+
+      return parts.length > 0
+        ? `[Thread context:]\n${parts.join('\n')}`
+        : null;
+    } catch (err) {
+      logger.debug({ err, threadTs }, 'Failed to fetch thread context');
+      return null;
     }
   }
 
