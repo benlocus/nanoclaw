@@ -16,6 +16,7 @@ import {
   getDueTasks,
   getTaskById,
   logTaskRun,
+  updateTask,
   updateTaskAfterRun,
 } from './db.js';
 import { GroupQueue } from './group-queue.js';
@@ -116,9 +117,6 @@ async function runTask(
       async (streamedOutput: ContainerOutput) => {
         if (streamedOutput.result) {
           result = streamedOutput.result;
-          // Forward result to user (sendMessage handles formatting)
-          await deps.sendMessage(task.chat_jid, streamedOutput.result);
-          // Only reset idle timer on actual results, not session-update markers
           resetIdleTimer();
         }
         if (streamedOutput.status === 'error') {
@@ -199,6 +197,19 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
         const currentTask = getTaskById(task.id);
         if (!currentTask || currentTask.status !== 'active') {
           continue;
+        }
+
+        // Advance next_run immediately so the next poll won't re-enqueue this task.
+        // Without this, long-running tasks (>60s) get picked up again on the next poll
+        // because next_run is still in the past until the container finishes.
+        if (currentTask.schedule_type === 'cron') {
+          const interval = CronExpressionParser.parse(currentTask.schedule_value, { tz: TIMEZONE });
+          updateTask(currentTask.id, { next_run: interval.next().toISOString() });
+        } else if (currentTask.schedule_type === 'interval') {
+          const ms = parseInt(currentTask.schedule_value, 10);
+          updateTask(currentTask.id, { next_run: new Date(Date.now() + ms).toISOString() });
+        } else if (currentTask.schedule_type === 'once') {
+          updateTask(currentTask.id, { next_run: null, status: 'completed' });
         }
 
         deps.queue.enqueueTask(
