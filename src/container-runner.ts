@@ -14,7 +14,6 @@ import {
   DATA_DIR,
   GROUPS_DIR,
   IDLE_TIMEOUT,
-  MODEL,
 } from './config.js';
 import { readEnvFile } from './env.js';
 import { logger } from './logger.js';

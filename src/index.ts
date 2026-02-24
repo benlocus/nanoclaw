@@ -271,7 +271,7 @@ async function runAgent(
         groupFolder: group.folder,
         chatJid,
         isMain,
-        ...(MODEL ? { model: MODEL } : {}),
+        ...(group.containerConfig?.model || MODEL ? { model: group.containerConfig?.model || MODEL } : {}),
       },
       (proc, containerName) => queue.registerProcess(chatJid, proc, containerName, group.folder),
       wrappedOnOutput,
