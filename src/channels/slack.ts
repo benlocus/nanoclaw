@@ -75,6 +75,7 @@ export class SlackChannel implements Channel {
   private userNameCache = new Map<string, string>();
   private typingReactions = new Map<string, { channel: string; timestamp: string }>();
   private replyThreadTs = new Map<string, string>();
+  private placeholderTs = new Map<string, string>(); // jid → placeholder message ts
 
   constructor(botToken: string, appToken: string, opts: SlackChannelOpts) {
     this.botToken = botToken;
@@ -278,21 +279,34 @@ export class SlackChannel implements Channel {
 
     const channel = jid.replace(/^slack:/, '');
     const threadTs = this.replyThreadTs.get(jid);
+    const placeholderTs = this.placeholderTs.get(jid);
 
     try {
       const chunks = splitMessage(text, 4000);
-      for (const chunk of chunks) {
-        await this.app.client.chat.postMessage({
-          channel,
-          text: chunk,
-          ...(threadTs && { thread_ts: threadTs }),
-        });
+      for (let i = 0; i < chunks.length; i++) {
+        if (i === 0 && placeholderTs) {
+          // Replace placeholder with first chunk
+          await this.app.client.chat.update({
+            channel,
+            ts: placeholderTs,
+            text: chunks[i],
+          });
+          this.placeholderTs.delete(jid);
+        } else {
+          await this.app.client.chat.postMessage({
+            channel,
+            text: chunks[i],
+            ...(threadTs && { thread_ts: threadTs }),
+          });
+        }
       }
       // Clear after sending — next top-level message should go to channel
       this.replyThreadTs.delete(jid);
-      logger.info({ jid, length: text.length, threadTs }, 'Slack message sent');
+      logger.info({ jid, length: text.length, threadTs, replacedPlaceholder: !!placeholderTs }, 'Slack message sent');
     } catch (err) {
       logger.error({ jid, err }, 'Failed to send Slack message');
+      // Clean up placeholder ref on error
+      this.placeholderTs.delete(jid);
     }
   }
 
@@ -314,27 +328,32 @@ export class SlackChannel implements Channel {
 
   async setTyping(jid: string, isTyping: boolean): Promise<void> {
     if (!this.app) return;
-    const msg = this.typingReactions.get(jid);
-    if (!msg) return;
+    const channel = jid.replace(/^slack:/, '');
+    const threadTs = this.replyThreadTs.get(jid);
 
-    try {
-      if (isTyping) {
-        await this.app.client.reactions.add({
-          channel: msg.channel,
-          timestamp: msg.timestamp,
-          name: 'rocket',
+    if (isTyping) {
+      try {
+        const result = await this.app.client.chat.postMessage({
+          channel,
+          text: `_${ASSISTANT_NAME} is thinking..._`,
+          ...(threadTs && { thread_ts: threadTs }),
         });
-      } else {
-        await this.app.client.reactions.remove({
-          channel: msg.channel,
-          timestamp: msg.timestamp,
-          name: 'rocket',
-        });
+        if (result.ts) {
+          this.placeholderTs.set(jid, result.ts);
+        }
+      } catch (err) {
+        logger.debug({ jid, err }, 'Failed to send placeholder message');
       }
-    } catch (err: any) {
-      // Ignore already_reacted / no_reaction errors
-      if (err?.data?.error !== 'already_reacted' && err?.data?.error !== 'no_reaction') {
-        logger.debug({ jid, isTyping, err }, 'Failed to update typing reaction');
+    } else {
+      // Clean up: if placeholder still exists (no output was sent), delete it
+      const placeholderTs = this.placeholderTs.get(jid);
+      if (placeholderTs) {
+        this.placeholderTs.delete(jid);
+        try {
+          await this.app.client.chat.delete({ channel, ts: placeholderTs });
+        } catch (err) {
+          logger.debug({ jid, err }, 'Failed to delete placeholder message');
+        }
       }
     }
   }
