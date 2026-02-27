@@ -28,6 +28,35 @@ function formatFileSize(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+/** Detect actual file type from magic bytes. Returns extension or null if unknown. */
+function detectFileType(filePath: string): string | null {
+  let buf: Buffer;
+  try {
+    const fd = fs.openSync(filePath, 'r');
+    buf = Buffer.alloc(16);
+    fs.readSync(fd, buf, 0, 16, 0);
+    fs.closeSync(fd);
+  } catch {
+    return null;
+  }
+
+  // PDF: %PDF
+  if (buf[0] === 0x25 && buf[1] === 0x50 && buf[2] === 0x44 && buf[3] === 0x46) return 'pdf';
+  // PNG: 89 50 4E 47
+  if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return 'png';
+  // JPEG: FF D8 FF
+  if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'jpg';
+  // GIF: GIF8
+  if (buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x38) return 'gif';
+  // ZIP/DOCX/XLSX: PK
+  if (buf[0] === 0x50 && buf[1] === 0x4b && buf[2] === 0x03 && buf[3] === 0x04) return 'zip';
+  // HTML: starts with < (<!DOCTYPE or <html)
+  const head = buf.toString('ascii', 0, 15).trimStart().toLowerCase();
+  if (head.startsWith('<!doctype') || head.startsWith('<html')) return 'html';
+
+  return null;
+}
+
 export interface SlackChannelOpts {
   onMessage: OnInboundMessage;
   onChatMetadata: OnChatMetadata;
@@ -172,7 +201,18 @@ export class SlackChannel implements Channel {
         const ok = await this.downloadFile(downloadUrl, hostPath);
         if (ok) {
           const sizeStr = f.size ? ` ${formatFileSize(f.size)}` : '';
-          fileParts.push(`[File: ${containerPath}] (${fileType}: ${fileName},${sizeStr})`);
+          // Detect actual file type via magic bytes and rename if mismatched
+          const actual = detectFileType(hostPath);
+          const claimed = path.extname(safeName).slice(1).toLowerCase();
+          if (actual && actual !== claimed) {
+            const correctedName = safeName.replace(/\.[^.]+$/, `.${actual}`);
+            const correctedHost = path.join(uploadsDir, correctedName);
+            fs.renameSync(hostPath, correctedHost);
+            const correctedContainer = `/workspace/group/uploads/${correctedName}`;
+            fileParts.push(`[File: ${correctedContainer}] (WARNING: uploaded as ${fileType} but actual content is ${actual.toUpperCase()}, renamed. Original: ${fileName},${sizeStr})`);
+          } else {
+            fileParts.push(`[File: ${containerPath}] (${fileType}: ${fileName},${sizeStr})`);
+          }
         } else {
           fileParts.push(`[${fileType}: ${fileName} — download failed]`);
         }
